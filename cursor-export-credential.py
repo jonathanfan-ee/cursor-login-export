@@ -3,10 +3,11 @@
 
 This utility deliberately has a very small scope:
 
-* it opens Cursor's ``state.vscdb`` in SQLite read-only mode;
+* it reads Cursor's ``state.vscdb`` without modifying the source; ``--snapshot``
+  may create a private temporary copy and change only that copy's journal mode;
 * it retries transient SQLite WAL races; an explicit ``--snapshot`` makes a
-  temporary rollback-mode copy, while ``--immutable`` is a clearly warned
-  advanced mode for a static main-file copy;
+  temporary rollback-mode copy (or a clearly warned main-file copy when no WAL
+  frames are present), while ``--immutable`` is an advanced static-file mode;
 * it reads ``cursorAuth/accessToken`` and, when present, cached account metadata
   plus the legacy ``cursorAuth/userId``/``cursorAuth/refreshToken`` fields;
 * it derives the canonical ``userId::accessToken`` from the access JWT subject
@@ -29,6 +30,7 @@ import argparse
 import base64
 import binascii
 import datetime as _datetime
+import errno as _errno
 import json
 import os
 import platform
@@ -59,12 +61,14 @@ JWT_PART_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 # checkpointing the database.  An automatic ``immutable=1`` fallback would
 # risk silently ignoring newer WAL
 # frames.  The latter is therefore available only through the explicit
-# ``--immutable`` option below; ``--snapshot`` uses SQLite backup and fails
-# closed if a coherent WAL view cannot be opened.
+# ``--immutable`` option below.  ``--snapshot`` uses SQLite backup when a
+# non-empty WAL is present, and only falls back to a warned private main-file
+# copy when there are no on-disk WAL frames.
 READ_ATTEMPTS = 5
 READ_RETRY_DELAY_SECONDS = 0.35
 SNAPSHOT_ATTEMPTS = 3
 SNAPSHOT_BACKUP_PAGES = 2048
+WAL_HEADER_BYTES = 32
 
 
 class CredentialError(RuntimeError):
@@ -334,17 +338,38 @@ def _require_wal_sidecars(db_path: Path) -> None:
 
     if not _database_uses_wal(db_path):
         return
+    wal_status, wal_size = _inspect_sidecar(_sidecar_path(db_path, "-wal"))
+    # A cleanly closed WAL database commonly has no WAL file at all (or an
+    # empty/header-only file).  There are no frames to merge in that state, but
+    # a strict read-only connection may still be unable to create its index;
+    # the explicit --snapshot path handles it by copying the main file.
+    if wal_status == "missing" or (
+        wal_status == "file"
+        and wal_size is not None
+        and wal_size in (0, WAL_HEADER_BYTES)
+    ):
+        raise _WalSidecarUnavailable("WAL file absent or contains no frames")
+
     missing: List[str] = []
-    for suffix in ("-wal", "-shm"):
-        sidecar = _sidecar_path(db_path, suffix)
-        status, _ = _inspect_sidecar(sidecar)
-        if status != "file":
-            missing.append(suffix)
+    if wal_status != "file":
+        missing.append("-wal")
+    shm_status, _ = _inspect_sidecar(_sidecar_path(db_path, "-shm"))
+    if shm_status != "file":
+        missing.append("-shm")
     if missing:
         names = ", ".join(missing)
-        raise _WalSidecarUnavailable(
-            f"WAL sidecar missing: {names}"
-        )
+        raise _WalSidecarUnavailable(f"WAL sidecar missing or unusable: {names}")
+
+
+def _wal_main_file_only(db_path: Path) -> bool:
+    """Return whether a WAL-marked source has no on-disk frames to merge."""
+
+    if not _database_uses_wal(db_path):
+        return False
+    status, size = _inspect_sidecar(_sidecar_path(db_path, "-wal"))
+    return status == "missing" or (
+        status == "file" and size is not None and size in (0, WAL_HEADER_BYTES)
+    )
 
 
 def _query_auth_values(connection: sqlite3.Connection) -> Dict[str, Optional[str]]:
@@ -403,9 +428,22 @@ def _retryable_read_error(exc: BaseException) -> bool:
     """Return whether a SQLite/OS error can plausibly be a transient WAL race."""
 
     if isinstance(exc, OSError):
-        # The database path has already been checked by ``locate_db``.  A
-        # short retry is still harmless for transient filesystem errors, while
-        # the final diagnostic explains the likely cause.
+        # The database path has already been checked by ``locate_db``.  Keep
+        # retrying races such as a sidecar disappearing, but do not repeat a
+        # potentially multi-gigabyte snapshot after a permanent destination
+        # failure (permissions, read-only disk, or insufficient space).
+        permanent = {
+            _errno.EACCES,
+            _errno.EPERM,
+            _errno.ENOSPC,
+            getattr(_errno, "EDQUOT", -1),
+            _errno.EROFS,
+            _errno.EINVAL,
+            _errno.EISDIR,
+            _errno.ENAMETOOLONG,
+        }
+        if getattr(exc, "errno", None) in permanent:
+            return False
         return True
     if not isinstance(exc, sqlite3.Error):
         return False
@@ -502,28 +540,47 @@ def _read_error_message(
             "请确认输入是完整、静态的数据库副本；不要对正在运行的 Cursor 使用此模式。"
         )
     if snapshot:
+        if _wal_main_file_only(db_path):
+            return (
+                "创建 state.vscdb 主文件临时快照失败（"
+                f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+                "当前未发现可读取的 WAL 帧；请完全退出 Cursor/FlyCursor 和 SpecStory 后重试，"
+                "并确认临时目录有足够空间。可能是正常 checkpoint，也可能是 WAL sidecar 曾被异常删除；"
+                "主文件因此可能缺少最近写入。"
+            )
         return (
             "创建 state.vscdb 临时快照失败（"
             f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
             "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试；"
-            "不要手动删除 -wal/-shm 文件；缺失的 WAL 内容无法由脚本恢复。"
-            "若 sidecar 已从磁盘丢失，只能从同一时刻的完整备份恢复或重新登录；"
+            "当前版本不会手动拼接或删除 -wal/-shm 文件。"
+            "若 -wal 已从磁盘丢失，其中的提交无法由脚本恢复；"
+            "请从同一时刻的完整备份恢复或重新登录；"
             "只有确认主文件是完整、静态副本时，才可显式使用 --immutable（可能读到旧值）。"
+        )
+    if _database_uses_wal(db_path) and _wal_main_file_only(db_path):
+        return (
+            "读取 state.vscdb 失败（"
+            f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+            "当前未发现可读取的 WAL 帧；普通模式不会自动读取可能过期的主文件，"
+            "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试，或显式使用 --snapshot 制作主文件副本。"
+            "该副本可能缺少最近写入，请核对账号和有效期。"
         )
     if _database_uses_wal(db_path) and not _wal_sidecars_complete(db_path):
         return (
             "读取 state.vscdb 失败（"
             f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
-            "当前 WAL sidecar 不完整，--snapshot 也无法恢复已经丢失的 WAL 内容；"
-            "请完全退出 Cursor/FlyCursor 和 SpecStory，并从同一时刻的完整备份恢复，或重新登录。"
-            "只有确认主文件完整静态时才考虑显式 --immutable（可能读到旧值）。"
+            "当前 WAL sidecar 不完整；为避免在源库可能被占用时重建索引，--snapshot 暂不拼接或修改 sidecar。"
+            "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试，并保留同目录的 -wal/-shm 文件。"
+            "如果 -wal 确实已经丢失，其中的提交无法由脚本恢复；只有确认主文件完整静态时，"
+            "才考虑显式 --immutable（可能读到旧值）。"
         )
     return (
         "读取 state.vscdb 失败（"
         f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
         "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试；"
         "如果 sidecar 随后恢复，可显式加 --snapshot 创建临时副本；"
-        "缺失的 WAL 内容无法恢复；如已丢失，只能从完整备份恢复或重新登录；"
+        "当前版本不会手动拼接或删除 sidecar；如 -wal 已丢失，其中的提交只能从完整备份恢复，"
+        "或重新登录；"
         "只有确认主文件完整静态时才考虑 --immutable。"
     )
 
@@ -533,20 +590,7 @@ def _copy_connection_to_snapshot(
 ) -> None:
     """Copy a stable SQLite connection into a private rollback-mode database."""
 
-    # Create the destination with restrictive permissions before SQLite opens
-    # it.  The temporary directory is private too, but avoiding even a brief
-    # world-readable window matters because the backup contains all local
-    # Cursor settings, including authentication material.
-    try:
-        fd = os.open(
-            str(snapshot_path),
-            os.O_CREAT | os.O_EXCL | os.O_RDWR,
-            0o600,
-        )
-    except OSError:
-        raise
-    else:
-        os.close(fd)
+    _create_private_file(snapshot_path)
 
     destination = sqlite3.connect(
         str(snapshot_path), timeout=2.0, isolation_level=None
@@ -576,6 +620,56 @@ def _copy_connection_to_snapshot(
         pass
 
 
+def _create_private_file(path: Path) -> None:
+    """Create an empty 0600 file before writing secret-bearing snapshot data."""
+
+    # Create the destination with restrictive permissions before SQLite opens
+    # it.  The temporary directory is private too, but avoiding even a brief
+    # world-readable window matters because the backup contains all local
+    # Cursor settings, including authentication material.
+    fd = os.open(
+        str(path),
+        os.O_CREAT | os.O_EXCL | os.O_RDWR,
+        0o600,
+    )
+    os.close(fd)
+
+
+def _copy_main_file_to_snapshot(db_path: Path, snapshot_path: Path) -> None:
+    """Copy a WAL main file into a private rollback-mode snapshot.
+
+    This is used only when there is no on-disk WAL frame to merge.  It never
+    edits the source; the writable SQLite connection below belongs solely to
+    the temporary copy and changes its persistent journal mode to DELETE.
+    """
+
+    _create_private_file(snapshot_path)
+    try:
+        # ``copyfile`` follows an explicit DB symlink just as SQLite does.
+        # The destination already has mode 0600, so truncation does not open a
+        # world-readable window for the copied authentication material.
+        shutil.copyfile(str(db_path), str(snapshot_path))
+        destination = sqlite3.connect(
+            str(snapshot_path), timeout=2.0, isolation_level=None
+        )
+        try:
+            journal_mode = destination.execute(
+                "PRAGMA journal_mode = DELETE"
+            ).fetchone()
+            if not journal_mode or str(journal_mode[0]).lower() != "delete":
+                raise sqlite3.OperationalError(
+                    "main-file snapshot did not switch to rollback journal mode"
+                )
+            destination.commit()
+        finally:
+            destination.close()
+    finally:
+        try:
+            os.chmod(snapshot_path, 0o600)
+        except OSError:
+            pass
+
+
 def _open_snapshot_source(db_path: Path) -> sqlite3.Connection:
     """Open and pin a read transaction for a temporary SQLite snapshot."""
 
@@ -595,7 +689,12 @@ def _open_snapshot_source(db_path: Path) -> sqlite3.Connection:
 
 
 def _read_auth_values_snapshot(db_path: Path) -> AuthReadResult:
-    """Read through a temporary SQLite snapshot; never bypass WAL implicitly."""
+    """Read through a temporary snapshot without silently bypassing WAL.
+
+    A source with a non-empty WAL is copied through SQLite's backup API.  A
+    WAL-marked source with no frames is copied as a warned static main-file
+    snapshot because there is no WAL content for the backup API to merge.
+    """
 
     last_error: Optional[BaseException] = None
     attempts_completed = 0
@@ -604,6 +703,36 @@ def _read_auth_values_snapshot(db_path: Path) -> AuthReadResult:
         source: Optional[sqlite3.Connection] = None
         try:
             before = _file_signature(db_path)
+
+            # A cleanly closed WAL database keeps the WAL header in the main
+            # file but normally unlinks both sidecars.  There is then no WAL
+            # frame for SQLite's backup API to merge, and a strict mode=ro
+            # connection may still fail because it cannot create the index.
+            # Copy the main file into our private temp directory instead.  The
+            # result is deliberately marked as potentially stale: an
+            # improperly deleted WAL cannot be reconstructed from the main
+            # file alone.
+            if _wal_main_file_only(db_path):
+                with tempfile.TemporaryDirectory(
+                    prefix="cursor-export-snapshot-"
+                ) as directory:
+                    snapshot_path = Path(directory) / "state.vscdb"
+                    _copy_main_file_to_snapshot(db_path, snapshot_path)
+                    after = _file_signature(db_path)
+                    if before != after or not _wal_main_file_only(db_path):
+                        raise sqlite3.OperationalError(
+                            "source database or WAL state changed while copying main file"
+                        )
+                    values = _read_auth_values_once(snapshot_path)
+                return AuthReadResult(
+                    values=values,
+                    warnings=[
+                        "未发现可合并的 WAL；已读取主库静态临时副本。"
+                        "这可能是正常 checkpoint 后的状态，也可能缺少最近写入；"
+                        "请核对账号和有效期。"
+                    ],
+                )
+
             source = _open_snapshot_source(db_path)
             with tempfile.TemporaryDirectory(
                 prefix="cursor-export-snapshot-"
@@ -1456,6 +1585,47 @@ def self_test() -> None:
             raise AssertionError("main-only WAL file unexpectedly read without sidecars")
         assert not Path(str(main_only_db) + "-wal").exists()
         assert not Path(str(main_only_db) + "-shm").exists()
+        main_only_source_signature = _file_signature(main_only_db)
+        main_only_snapshot = load_credential(main_only_db, snapshot=True)
+        assert main_only_snapshot.access_token == old_access
+        assert any(
+            "主库静态临时副本" in warning
+            for warning in main_only_snapshot.warnings
+        )
+        assert _file_signature(main_only_db) == main_only_source_signature
+        assert not Path(str(main_only_db) + "-wal").exists()
+        assert not Path(str(main_only_db) + "-shm").exists()
+
+        # A zero-length/header-only WAL has no frames to merge and follows the
+        # same explicit snapshot fallback.  Keep the sidecar beside the test
+        # copy so the source database itself remains untouched.
+        header_only_db = root / "wal-header-only.vscdb"
+        shutil.copyfile(main_only_db, header_only_db)
+        Path(str(header_only_db) + "-wal").write_bytes(b"\x00" * WAL_HEADER_BYTES)
+        header_source_signature = _file_signature(header_only_db)
+        header_snapshot = load_credential(header_only_db, snapshot=True)
+        assert header_snapshot.access_token == old_access
+        assert any(
+            "主库静态临时副本" in warning
+            for warning in header_snapshot.warnings
+        )
+        assert _file_signature(header_only_db) == header_source_signature
+        assert Path(str(header_only_db) + "-wal").stat().st_size == WAL_HEADER_BYTES
+        assert not Path(str(header_only_db) + "-shm").exists()
+
+        # A non-empty WAL without its shared-memory index must remain fail
+        # closed: the missing frames may contain a newer credential value.
+        incomplete_wal_db = root / "wal-incomplete.vscdb"
+        shutil.copyfile(main_only_db, incomplete_wal_db)
+        Path(str(incomplete_wal_db) + "-wal").write_bytes(
+            b"\x00" * (WAL_HEADER_BYTES + 1)
+        )
+        try:
+            load_credential(incomplete_wal_db, snapshot=True)
+        except CredentialError as exc:
+            assert "-shm" in str(exc)
+        else:
+            raise AssertionError("snapshot unexpectedly bypassed an incomplete WAL")
         stale = load_credential(main_only_db, immutable=True)
         assert stale.access_token == old_access
         assert any("immutable" in warning for warning in stale.warnings)
@@ -1647,8 +1817,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--snapshot",
         action="store_true",
         help=(
-            "先用只读 SQLite backup 创建临时副本再读取；适合 WAL 状态切换，"
-            "不会静默忽略 WAL，临时文件会自动删除"
+            "先创建临时副本再读取；有非空 WAL 时用只读 SQLite backup，"
+            "无 WAL 帧时复制主库并给出可能过期的警告，临时文件自动删除"
         ),
     )
     parser.add_argument(
