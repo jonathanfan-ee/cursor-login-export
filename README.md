@@ -132,6 +132,29 @@ Windows 同样只需把参数接在 `py -3 -` 后面：
 curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --snapshot --show-token
 ```
 
+如果 Windows 上自动发现的路径不确定，可以先在 CMD 查看两个常见位置（`/a` 会显示隐藏文件）：
+
+```bat
+dir /a "%APPDATA%\Cursor\User\globalStorage\state.vscdb*"
+dir /a "%LOCALAPPDATA%\Cursor\User\globalStorage\state.vscdb*"
+```
+
+然后显式指定实际存在的库。CMD 写法：
+
+```bat
+curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py ^
+  | py -3 - --db "%APPDATA%\Cursor\User\globalStorage\state.vscdb" --snapshot --show-token
+```
+
+PowerShell 写法：
+
+```powershell
+curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --db "$env:APPDATA\Cursor\User\globalStorage\state.vscdb" --snapshot --show-token
+```
+
+只有确认 `-wal` 已经永久丢失、并接受主库可能是旧值时，才把上面命令中的
+`--snapshot` 换成 `--immutable`；该模式必须保留 `--db`。
+
 Windows CMD 或 PowerShell 使用 Windows 自带的原生 curl 和 Python Launcher：
 
 ```powershell
