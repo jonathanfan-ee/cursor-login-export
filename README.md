@@ -71,13 +71,21 @@ Windows 命令提示符双击入口会暂停在结果画面；脚本化调用若
 
 ## GitHub 一行命令
 
-仓库发布后，可以直接从 GitHub 把脚本流式交给本机 Python，不需要手动下载或落盘：
+仓库发布后，可以直接从 GitHub 把脚本流式交给本机 Python，不需要手动下载或落盘。
+终端里请粘贴纯 URL，不要带 Markdown 的 `[]()`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | python3 - --show-token
 ```
 
+Windows CMD 或 PowerShell 使用 Windows 自带的原生 curl 和 Python Launcher：
+
+```powershell
+curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --show-token
+```
+
 建议在实际分发时把 `main` 替换成已审核的完整 commit SHA，以避免远端分支变化带来的供应链风险。
+Windows PowerShell 5.1 中，裸写 `curl` 可能会被解析为 `Invoke-WebRequest`，因此这里明确写 `curl.exe`。
 私有仓库则不要使用公开 raw 地址；在已登录 GitHub CLI 的设备上运行：
 
 ```bash
@@ -86,7 +94,7 @@ gh api -H 'Accept: application/vnd.github.raw' \
   | python3 - --show-token
 ```
 
-上述命令需要目标设备已安装 `curl`/`gh` 和 Python 3.8+；不会把脚本保存到磁盘。
+上述命令需要目标设备已安装 `curl`/`curl.exe` 或 `gh`，以及 Python 3.8+；不会把脚本保存到磁盘。
 
 ## 最快用法
 
