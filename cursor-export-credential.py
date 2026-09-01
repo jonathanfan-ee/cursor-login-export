@@ -63,7 +63,7 @@ JWT_PART_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 # frames.  The latter is therefore available only through the explicit
 # ``--immutable`` option below.  ``--snapshot`` uses SQLite backup when a
 # non-empty WAL is present, and only falls back to a warned private main-file
-# copy when there are no on-disk WAL frames.
+# copy when there are no currently readable on-disk WAL frames.
 READ_ATTEMPTS = 5
 READ_RETRY_DELAY_SECONDS = 0.35
 SNAPSHOT_ATTEMPTS = 3
@@ -362,7 +362,7 @@ def _require_wal_sidecars(db_path: Path) -> None:
 
 
 def _wal_main_file_only(db_path: Path) -> bool:
-    """Return whether a WAL-marked source has no on-disk frames to merge."""
+    """Return whether a WAL-marked source has no currently readable frames."""
 
     if not _database_uses_wal(db_path):
         return False
@@ -692,8 +692,8 @@ def _read_auth_values_snapshot(db_path: Path) -> AuthReadResult:
     """Read through a temporary snapshot without silently bypassing WAL.
 
     A source with a non-empty WAL is copied through SQLite's backup API.  A
-    WAL-marked source with no frames is copied as a warned static main-file
-    snapshot because there is no WAL content for the backup API to merge.
+    WAL-marked source with no currently readable frames is copied as a warned
+    static main-file snapshot because no WAL content is available to merge.
     """
 
     last_error: Optional[BaseException] = None
@@ -705,8 +705,8 @@ def _read_auth_values_snapshot(db_path: Path) -> AuthReadResult:
             before = _file_signature(db_path)
 
             # A cleanly closed WAL database keeps the WAL header in the main
-            # file but normally unlinks both sidecars.  There is then no WAL
-            # frame for SQLite's backup API to merge, and a strict mode=ro
+            # file but normally unlinks both sidecars.  There is then no
+            # currently readable WAL frame for SQLite's backup API to merge, and a strict mode=ro
             # connection may still fail because it cannot create the index.
             # Copy the main file into our private temp directory instead.  The
             # result is deliberately marked as potentially stale: an
