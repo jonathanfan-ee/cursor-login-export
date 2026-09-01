@@ -4,6 +4,9 @@
 This utility deliberately has a very small scope:
 
 * it opens Cursor's ``state.vscdb`` in SQLite read-only mode;
+* it retries transient SQLite WAL races; an explicit ``--snapshot`` makes a
+  temporary rollback-mode copy, while ``--immutable`` is a clearly warned
+  advanced mode for a static main-file copy;
 * it reads ``cursorAuth/accessToken`` and, when present, cached account metadata
   plus the legacy ``cursorAuth/userId``/``cursorAuth/refreshToken`` fields;
 * it derives the canonical ``userId::accessToken`` from the access JWT subject
@@ -30,7 +33,9 @@ import json
 import os
 import platform
 import re
+import shutil
 import sqlite3
+import stat as _stat
 import sys
 import tempfile
 import time
@@ -48,9 +53,26 @@ AUTH_KEYS: Tuple[str, ...] = (
 USER_ID_RE = re.compile(r"^user_[A-Za-z0-9._-]+$")
 JWT_PART_RE = re.compile(r"^[A-Za-z0-9_-]+={0,2}$")
 
+# Cursor keeps this database in SQLite WAL mode on many installations.  A
+# read-only client may fail when required ``-wal``/``-shm`` sidecars are
+# unavailable, so a short retry is useful while Cursor/its extensions are
+# checkpointing the database.  An automatic ``immutable=1`` fallback would
+# risk silently ignoring newer WAL
+# frames.  The latter is therefore available only through the explicit
+# ``--immutable`` option below; ``--snapshot`` uses SQLite backup and fails
+# closed if a coherent WAL view cannot be opened.
+READ_ATTEMPTS = 5
+READ_RETRY_DELAY_SECONDS = 0.35
+SNAPSHOT_ATTEMPTS = 3
+SNAPSHOT_BACKUP_PAGES = 2048
+
 
 class CredentialError(RuntimeError):
     """An expected, user-actionable credential/export error."""
+
+
+class _WalSidecarUnavailable(OSError):
+    """The main file declares WAL mode but a required sidecar is unavailable."""
 
 
 @dataclass
@@ -80,6 +102,16 @@ class Credential:
     email_source: Optional[str] = field(default=None, repr=False)
     refresh_token: Optional[str] = field(default=None, repr=False)
     refresh_info: Optional[TokenInfo] = field(default=None, repr=False)
+    warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class AuthReadResult:
+    """Values read from ``ItemTable`` plus non-secret database warnings."""
+
+    # The mapping contains access/refresh secrets; keep it out of accidental
+    # dataclass repr/debug output just like ``Credential`` does.
+    values: Dict[str, Optional[str]] = field(repr=False)
     warnings: List[str] = field(default_factory=list)
 
 
@@ -185,14 +217,25 @@ def locate_db(explicit: Optional[str]) -> Path:
     return found[0]
 
 
-def _sqlite_uri(path: Path) -> str:
-    """Build a read-only SQLite URI that works with spaces and Windows paths."""
+def _sqlite_uri(path: Path, *, immutable: bool = False) -> str:
+    """Build a read-only SQLite URI that works with spaces and Windows paths.
+
+    ``immutable=1`` is intentionally opt-in.  SQLite then ignores WAL and
+    locking files, which is useful only for an explicitly requested static
+    main-file read and can omit frames that have not been checkpointed into the
+    main database.
+    """
 
     # ``Path.as_uri`` handles drive letters, separators, spaces and URI control
-    # characters on each supported platform.  Appending only ``mode=ro`` keeps
-    # SQLite from creating or mutating the database.
+    # characters on each supported platform.  ``mode=ro`` prevents writes to
+    # the main database and its business tables.  A WAL reader may still create
+    # or update SQLite's ``-shm`` locking sidecar on some builds.  The immutable
+    # flag is added only for the explicit advanced mode.
     try:
-        return path.absolute().as_uri() + "?mode=ro"
+        query = "mode=ro"
+        if immutable:
+            query += "&immutable=1"
+        return path.absolute().as_uri() + "?" + query
     except ValueError as exc:
         raise CredentialError("state.vscdb 路径无法转换为只读 SQLite URI") from exc
 
@@ -223,48 +266,460 @@ def _db_text(value: Any) -> Optional[str]:
     return text or None
 
 
-def read_auth_values(db_path: Path) -> Dict[str, Optional[str]]:
-    """Read auth values through a strictly read-only SQLite connection."""
+def _database_uses_wal(db_path: Path) -> bool:
+    """Inspect SQLite's 20-byte header without opening or changing the DB."""
 
     try:
-        connection = sqlite3.connect(
-            _sqlite_uri(db_path), uri=True, timeout=2.0, isolation_level=None
-        )
-    except (sqlite3.Error, OSError) as exc:
-        raise CredentialError(
-            "无法以只读方式打开 state.vscdb（Cursor 可能正在写入；可先复制数据库后重试）"
-        ) from exc
+        with db_path.open("rb") as stream:
+            header = stream.read(20)
+    except (OSError, RuntimeError):
+        # Let SQLite produce the normal actionable error for an unreadable or
+        # disappearing path; this helper must not turn it into a false WAL
+        # diagnosis.
+        return False
+    if len(header) < 20 or header[:16] != b"SQLite format 3\x00":
+        return False
+    # Bytes 18 and 19 are the file-format read/write versions.  A value of 2
+    # denotes WAL mode; either byte is enough to require the sidecars for a
+    # coherent read-only view.
+    return header[18] == 2 or header[19] == 2
+
+
+def _sidecar_path(db_path: Path, suffix: str) -> Path:
+    """Return a WAL sidecar path next to the actual DB target.
+
+    SQLite follows a symlink supplied as the database filename and places its
+    ``-wal``/``-shm`` files next to the symlink target, not next to the alias.
+    Resolve an existing path before checking sidecars so an explicit
+    ``--db /path/to/link.vscdb`` behaves like SQLite itself.
+    """
 
     try:
+        base = db_path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        # Preserve a useful path for the final diagnostic when the file is
+        # disappearing or cannot be resolved; SQLite will report the actual
+        # open error below.
+        base = db_path.absolute()
+    return Path(str(base) + suffix)
+
+
+def _inspect_sidecar(path: Path) -> Tuple[str, Optional[int]]:
+    """Inspect a sidecar without treating permission errors as absence.
+
+    The first ``lstat`` also makes a dangling symlink visible.  Such an alias
+    is not usable for a coherent SQLite read, and is therefore reported as
+    ``unavailable`` rather than silently treated as a missing file.
+    """
+
+    try:
+        info = os.lstat(str(path))
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "unavailable", None
+
+    if _stat.S_ISLNK(info.st_mode):
         try:
-            connection.execute("PRAGMA query_only = ON")
-            # Cursor can update access/refresh/userId independently while a
-            # refresh is in progress.  A read transaction gives all three
-            # values one coherent snapshot and still cannot mutate the DB.
-            connection.execute("BEGIN")
-            table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ItemTable'"
+            info = os.stat(str(path))
+        except OSError:
+            return "unavailable", None
+    if not _stat.S_ISREG(info.st_mode):
+        return "other", int(info.st_size)
+    return "file", int(info.st_size)
+
+
+def _require_wal_sidecars(db_path: Path) -> None:
+    """Fail closed instead of allowing SQLite to open a stale main-only WAL."""
+
+    if not _database_uses_wal(db_path):
+        return
+    missing: List[str] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = _sidecar_path(db_path, suffix)
+        status, _ = _inspect_sidecar(sidecar)
+        if status != "file":
+            missing.append(suffix)
+    if missing:
+        names = ", ".join(missing)
+        raise _WalSidecarUnavailable(
+            f"WAL sidecar missing: {names}"
+        )
+
+
+def _query_auth_values(connection: sqlite3.Connection) -> Dict[str, Optional[str]]:
+    """Read the auth rows from an already-open, read-only connection."""
+
+    connection.execute("PRAGMA query_only = ON")
+    # Cursor can update access/refresh/userId independently while a refresh is
+    # in progress.  A read transaction gives all three values one coherent
+    # snapshot and still cannot mutate the DB.
+    connection.execute("BEGIN")
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'ItemTable'"
+        ).fetchone()
+        if table is None:
+            raise CredentialError(
+                "state.vscdb 缺少 ItemTable，可能不是 Cursor 配置库或格式已变化"
+            )
+        values: Dict[str, Optional[str]] = {}
+        for key in AUTH_KEYS:
+            row = connection.execute(
+                "SELECT value FROM ItemTable WHERE key = ?1 LIMIT 1", (key,)
             ).fetchone()
-            if table is None:
-                raise CredentialError(
-                    "state.vscdb 缺少 ItemTable，可能不是 Cursor 配置库或格式已变化"
-                )
-            values: Dict[str, Optional[str]] = {}
-            for key in AUTH_KEYS:
-                row = connection.execute(
-                    "SELECT value FROM ItemTable WHERE key = ?1 LIMIT 1", (key,)
-                ).fetchone()
-                values[key] = _db_text(row[0]) if row else None
+            values[key] = _db_text(row[0]) if row else None
+        return values
+    finally:
+        # A failed SELECT can leave the transaction open.  Rollback is best
+        # effort because the connection is closed by the caller immediately
+        # afterwards, and must never mask the original error.
+        try:
             connection.execute("ROLLBACK")
-            return values
+        except (sqlite3.Error, OSError):
+            pass
+
+
+def _read_auth_values_once(
+    db_path: Path, *, immutable: bool = False
+) -> Dict[str, Optional[str]]:
+    """Read auth values once through a strictly read-only SQLite connection."""
+
+    if not immutable:
+        _require_wal_sidecars(db_path)
+    connection = sqlite3.connect(
+        _sqlite_uri(db_path, immutable=immutable),
+        uri=True,
+        timeout=2.0,
+        isolation_level=None,
+    )
+    try:
+        return _query_auth_values(connection)
+    finally:
+        connection.close()
+
+
+def _retryable_read_error(exc: BaseException) -> bool:
+    """Return whether a SQLite/OS error can plausibly be a transient WAL race."""
+
+    if isinstance(exc, OSError):
+        # The database path has already been checked by ``locate_db``.  A
+        # short retry is still harmless for transient filesystem errors, while
+        # the final diagnostic explains the likely cause.
+        return True
+    if not isinstance(exc, sqlite3.Error):
+        return False
+
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        # SQLite extended result codes keep the primary code in the low byte.
+        primary = code & 0xFF
+        if primary in {5, 6, 7, 10, 14, 15, 17}:  # BUSY/LOCKED/.../CANTOPEN
+            return True
+        if primary in {11, 12, 13, 20, 26}:  # CORRUPT/NOTADB and hard errors
+            return False
+
+    message = str(exc).lower()
+    if "malformed" in message or "not a database" in message:
+        return False
+    return isinstance(exc, sqlite3.OperationalError)
+
+
+def _file_signature(path: Path) -> Tuple[int, int, int, int, int]:
+    """Return a cheap identity/size/time tuple for source-change detection."""
+
+    stat = path.stat()
+    return (
+        int(getattr(stat, "st_dev", 0)),
+        int(getattr(stat, "st_ino", 0)),
+        int(stat.st_size),
+        int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+        int(getattr(stat, "st_ctime_ns", int(stat.st_ctime * 1_000_000_000))),
+    )
+
+
+def _wal_sidecar_state(db_path: Path) -> str:
+    """Describe WAL sidecars without reading their contents or secrets."""
+
+    states: List[str] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = _sidecar_path(db_path, suffix)
+        status, size = _inspect_sidecar(sidecar)
+        if status == "file":
+            states.append(f"{suffix}=存在({size} 字节)")
+        elif status == "missing":
+            states.append(f"{suffix}=缺失")
+        elif status == "other":
+            states.append(f"{suffix}=不是普通文件")
+        else:
+            states.append(f"{suffix}=无法检查")
+    return "，".join(states)
+
+
+def _wal_sidecars_complete(db_path: Path) -> bool:
+    """Return whether a WAL-marked DB has both sidecars available."""
+
+    if not _database_uses_wal(db_path):
+        return False
+    for suffix in ("-wal", "-shm"):
+        status, _ = _inspect_sidecar(_sidecar_path(db_path, suffix))
+        if status != "file":
+            return False
+    return True
+
+
+def _guard_immutable_source(db_path: Path) -> None:
+    """Refuse immutable reads when WAL sidecars could contain newer values."""
+
+    sidecars: List[str] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = _sidecar_path(db_path, suffix)
+        status, size = _inspect_sidecar(sidecar)
+        if status == "unavailable":
+            raise CredentialError(
+                "无法确认 immutable 输入的 WAL sidecar 状态；为避免读取不完整凭证，已拒绝"
+            )
+        if status != "missing":
+            sidecars.append(
+                f"{suffix}（{size if size is not None else '非普通文件'}）"
+            )
+    if sidecars:
+        joined = "、".join(sidecars)
+        raise CredentialError(
+            f"拒绝 immutable：检测到 WAL sidecar {joined}。请关闭 Cursor 后使用 --snapshot；"
+            "不要删除这些文件。"
+        )
+
+
+def _read_error_message(
+    db_path: Path, attempts: int, *, snapshot: bool, immutable: bool = False
+) -> str:
+    sidecars = _wal_sidecar_state(db_path)
+    if immutable:
+        return (
+            "读取 state.vscdb 的 immutable 主文件失败（"
+            f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+            "请确认输入是完整、静态的数据库副本；不要对正在运行的 Cursor 使用此模式。"
+        )
+    if snapshot:
+        return (
+            "创建 state.vscdb 临时快照失败（"
+            f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+            "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试；"
+            "不要手动删除 -wal/-shm 文件；缺失的 WAL 内容无法由脚本恢复。"
+            "若 sidecar 已从磁盘丢失，只能从同一时刻的完整备份恢复或重新登录；"
+            "只有确认主文件是完整、静态副本时，才可显式使用 --immutable（可能读到旧值）。"
+        )
+    if _database_uses_wal(db_path) and not _wal_sidecars_complete(db_path):
+        return (
+            "读取 state.vscdb 失败（"
+            f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+            "当前 WAL sidecar 不完整，--snapshot 也无法恢复已经丢失的 WAL 内容；"
+            "请完全退出 Cursor/FlyCursor 和 SpecStory，并从同一时刻的完整备份恢复，或重新登录。"
+            "只有确认主文件完整静态时才考虑显式 --immutable（可能读到旧值）。"
+        )
+    return (
+        "读取 state.vscdb 失败（"
+        f"已重试 {attempts} 次；SQLite WAL 状态：{sidecars}）。"
+        "请完全退出 Cursor/FlyCursor 和 SpecStory 后重试；"
+        "如果 sidecar 随后恢复，可显式加 --snapshot 创建临时副本；"
+        "缺失的 WAL 内容无法恢复；如已丢失，只能从完整备份恢复或重新登录；"
+        "只有确认主文件完整静态时才考虑 --immutable。"
+    )
+
+
+def _copy_connection_to_snapshot(
+    source: sqlite3.Connection, snapshot_path: Path
+) -> None:
+    """Copy a stable SQLite connection into a private rollback-mode database."""
+
+    # Create the destination with restrictive permissions before SQLite opens
+    # it.  The temporary directory is private too, but avoiding even a brief
+    # world-readable window matters because the backup contains all local
+    # Cursor settings, including authentication material.
+    try:
+        fd = os.open(
+            str(snapshot_path),
+            os.O_CREAT | os.O_EXCL | os.O_RDWR,
+            0o600,
+        )
+    except OSError:
+        raise
+    else:
+        os.close(fd)
+
+    destination = sqlite3.connect(
+        str(snapshot_path), timeout=2.0, isolation_level=None
+    )
+    try:
+        # A bounded page size lets SQLite yield while copying a large Cursor
+        # database and keeps the operation interruptible.
+        source.backup(
+            destination,
+            pages=SNAPSHOT_BACKUP_PAGES,
+            sleep=0.05,
+        )
+        # ``backup`` copies page 1, including the source WAL header.  The
+        # temporary destination is ours, so switch it to rollback mode before
+        # reopening it with a strict mode=ro URI (which needs no sidecars).
+        journal_mode = destination.execute("PRAGMA journal_mode = DELETE").fetchone()
+        if not journal_mode or str(journal_mode[0]).lower() != "delete":
+            raise sqlite3.OperationalError(
+                "temporary snapshot did not switch to rollback journal mode"
+            )
+        destination.commit()
+    finally:
+        destination.close()
+    try:
+        os.chmod(snapshot_path, 0o600)
+    except OSError:
+        pass
+
+
+def _open_snapshot_source(db_path: Path) -> sqlite3.Connection:
+    """Open and pin a read transaction for a temporary SQLite snapshot."""
+
+    _require_wal_sidecars(db_path)
+    connection = sqlite3.connect(
+        _sqlite_uri(db_path), uri=True, timeout=2.0, isolation_level=None
+    )
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("BEGIN")
+        # Force the transaction to establish its snapshot before backup starts.
+        connection.execute("SELECT 1 FROM sqlite_master").fetchone()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _read_auth_values_snapshot(db_path: Path) -> AuthReadResult:
+    """Read through a temporary SQLite snapshot; never bypass WAL implicitly."""
+
+    last_error: Optional[BaseException] = None
+    attempts_completed = 0
+    for attempt in range(1, SNAPSHOT_ATTEMPTS + 1):
+        attempts_completed = attempt
+        source: Optional[sqlite3.Connection] = None
+        try:
+            before = _file_signature(db_path)
+            source = _open_snapshot_source(db_path)
+            with tempfile.TemporaryDirectory(
+                prefix="cursor-export-snapshot-"
+            ) as directory:
+                snapshot_path = Path(directory) / "state.vscdb"
+                _copy_connection_to_snapshot(source, snapshot_path)
+                source.close()
+                source = None
+
+                after = _file_signature(db_path)
+                if before != after:
+                    raise sqlite3.OperationalError(
+                        "source database changed while creating snapshot"
+                    )
+                values = _read_auth_values_once(snapshot_path)
+            return AuthReadResult(
+                values=values,
+                warnings=[
+                    "已使用临时 SQLite 快照读取；临时文件会在本次运行结束后删除"
+                ],
+            )
         except CredentialError:
             raise
         except (sqlite3.Error, OSError) as exc:
-            raise CredentialError(
-                "读取 state.vscdb 失败；请确认文件完整，必要时关闭 Cursor 后使用数据库副本"
-            ) from exc
-    finally:
-        connection.close()
+            last_error = exc
+            if not _retryable_read_error(exc) or attempt >= SNAPSHOT_ATTEMPTS:
+                break
+            time.sleep(READ_RETRY_DELAY_SECONDS * attempt)
+        finally:
+            if source is not None:
+                try:
+                    source.close()
+                except (sqlite3.Error, OSError):
+                    pass
+
+    raise CredentialError(
+        _read_error_message(db_path, attempts_completed, snapshot=True)
+    ) from last_error
+
+
+def _read_auth_values_immutable(db_path: Path) -> AuthReadResult:
+    """Read an explicitly supplied static main-file copy while warning loudly."""
+
+    _guard_immutable_source(db_path)
+    last_error: Optional[BaseException] = None
+    attempts_completed = 0
+    for attempt in range(1, READ_ATTEMPTS + 1):
+        attempts_completed = attempt
+        try:
+            before = _file_signature(db_path)
+            values = _read_auth_values_once(db_path, immutable=True)
+            after = _file_signature(db_path)
+            if before != after:
+                raise sqlite3.OperationalError(
+                    "source database changed while reading immutable copy"
+                )
+            return AuthReadResult(
+                values=values,
+                warnings=[
+                    "已显式使用 immutable 主文件读取；SQLite 会忽略 WAL，"
+                    "结果可能不含最近写入，仅适用于已完全退出 Cursor 的静态副本。"
+                ],
+            )
+        except CredentialError:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            last_error = exc
+            if not _retryable_read_error(exc) or attempt >= READ_ATTEMPTS:
+                break
+            time.sleep(READ_RETRY_DELAY_SECONDS * attempt)
+    raise CredentialError(
+        _read_error_message(
+            db_path, attempts_completed, snapshot=False, immutable=True
+        )
+    ) from last_error
+
+
+def _read_auth_values_result(
+    db_path: Path, *, snapshot: bool = False, immutable: bool = False
+) -> AuthReadResult:
+    """Read auth values plus warnings, retrying transient WAL races."""
+
+    if snapshot and immutable:
+        raise CredentialError("--snapshot 与 --immutable 不能同时使用")
+    if snapshot:
+        return _read_auth_values_snapshot(db_path)
+    if immutable:
+        return _read_auth_values_immutable(db_path)
+
+    last_error: Optional[BaseException] = None
+    attempts_completed = 0
+    for attempt in range(1, READ_ATTEMPTS + 1):
+        attempts_completed = attempt
+        try:
+            return AuthReadResult(values=_read_auth_values_once(db_path))
+        except CredentialError:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            last_error = exc
+            if not _retryable_read_error(exc) or attempt >= READ_ATTEMPTS:
+                break
+            time.sleep(READ_RETRY_DELAY_SECONDS * attempt)
+
+    raise CredentialError(
+        _read_error_message(db_path, attempts_completed, snapshot=False)
+    ) from last_error
+
+
+def read_auth_values(
+    db_path: Path, *, snapshot: bool = False, immutable: bool = False
+) -> Dict[str, Optional[str]]:
+    """Read auth values and preserve the original dictionary-returning API."""
+
+    return _read_auth_values_result(
+        db_path, snapshot=snapshot, immutable=immutable
+    ).values
 
 
 def _normalise_user_id(raw: Optional[str]) -> str:
@@ -422,8 +877,13 @@ def load_credential(
     *,
     allow_expired: bool = False,
     strict_user_id: bool = False,
+    snapshot: bool = False,
+    immutable: bool = False,
 ) -> Credential:
-    values = read_auth_values(db_path)
+    read_result = _read_auth_values_result(
+        db_path, snapshot=snapshot, immutable=immutable
+    )
+    values = read_result.values
     access_token = _normalise_access_token(
         values.get("cursorAuth/accessToken"),
         # The JWT subject is authoritative.  Do not compare a legacy/stale
@@ -444,7 +904,7 @@ def load_credential(
         if email:
             email_source = "JWT claim"
 
-    warnings: List[str] = []
+    warnings: List[str] = list(read_result.warnings)
     stored_user_raw = values.get("cursorAuth/userId")
     if stored_user_raw:
         try:
@@ -886,10 +1346,120 @@ def self_test() -> None:
         finally:
             connection.close()
 
+        source_signature = _file_signature(db_path)
         credential = load_credential(db_path)
         assert credential.session_token == f"{user_id}::{access}"
         assert credential.email == "demo@example.com"
         assert credential.email_source == "本地缓存"
+        assert _file_signature(db_path) == source_signature
+
+        # The explicit snapshot path should preserve the same coherent values
+        # while reading through a temporary rollback-mode copy.
+        snapshot_source_signature = _file_signature(db_path)
+        snapshot_credential = load_credential(db_path, snapshot=True)
+        assert snapshot_credential.session_token == credential.session_token
+        assert any("临时 SQLite 快照" in warning for warning in snapshot_credential.warnings)
+        assert _file_signature(db_path) == snapshot_source_signature
+
+        # Immutable mode is intentionally explicit and always carries a stale-
+        # data warning, even for a normal rollback-mode test database.
+        immutable_credential = load_credential(db_path, immutable=True)
+        assert immutable_credential.session_token == credential.session_token
+        assert any("immutable" in warning for warning in immutable_credential.warnings)
+
+        # Keep a WAL connection open while taking a snapshot.  The initial
+        # value is checkpointed in the main file and the replacement value is
+        # left in WAL, proving that normal/snapshot reads see the newest value
+        # while immutable main-file reads are intentionally stale.
+        old_access = _synthetic_jwt(
+            user_id, int(time.time()) + 3600, sub=f"auth0|{user_id}"
+        )
+        new_access = _synthetic_jwt(
+            user_id, int(time.time()) + 7200, sub=f"auth0|{user_id}"
+        )
+        wal_db = root / "wal.vscdb"
+        initial = sqlite3.connect(str(wal_db))
+        try:
+            initial.execute(
+                "CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)"
+            )
+            initial.executemany(
+                "INSERT INTO ItemTable(key, value) VALUES (?, ?)",
+                [
+                    ("cursorAuth/accessToken", old_access),
+                    ("cursorAuth/userId", user_id),
+                ],
+            )
+            initial.commit()
+        finally:
+            initial.close()
+
+        wal_connection = sqlite3.connect(str(wal_db))
+        wal_reader: Optional[sqlite3.Connection] = None
+        try:
+            journal_mode = wal_connection.execute(
+                "PRAGMA journal_mode = WAL"
+            ).fetchone()[0]
+            assert str(journal_mode).lower() == "wal"
+            # Pin an older reader before the replacement write.  This makes
+            # the test independent of whether a particular SQLite build
+            # checkpoints and removes the WAL immediately when the writer
+            # closes later.
+            wal_reader = sqlite3.connect(str(wal_db), isolation_level=None)
+            wal_reader.execute("BEGIN")
+            assert wal_reader.execute(
+                "SELECT value FROM ItemTable WHERE key = ?", ("cursorAuth/accessToken",)
+            ).fetchone()[0] == old_access
+            wal_connection.execute(
+                "UPDATE ItemTable SET value = ? WHERE key = ?",
+                (new_access, "cursorAuth/accessToken"),
+            )
+            wal_connection.commit()
+            live_credential = load_credential(wal_db)
+            assert live_credential.access_token == new_access
+            wal_credential = load_credential(wal_db, snapshot=True)
+            assert wal_credential.access_token == new_access
+
+            # SQLite follows a symlinked database filename but keeps WAL
+            # sidecars beside the target.  The preflight must resolve that
+            # target rather than looking beside the alias.
+            if os.name != "nt":
+                wal_link = root / "wal-link.vscdb"
+                try:
+                    wal_link.symlink_to(wal_db)
+                except OSError:
+                    pass
+                else:
+                    linked = load_credential(wal_link)
+                    assert linked.access_token == new_access
+
+            try:
+                load_credential(wal_db, immutable=True)
+            except CredentialError as exc:
+                assert "WAL sidecar" in str(exc)
+            else:
+                raise AssertionError("immutable mode did not reject a live WAL source")
+
+            # Copy only the main file to model a stale/incomplete handoff.
+            main_only_db = root / "wal-main-only.vscdb"
+            shutil.copyfile(wal_db, main_only_db)
+        finally:
+            wal_connection.close()
+            if wal_reader is not None:
+                wal_reader.close()
+
+        try:
+            load_credential(main_only_db)
+        except CredentialError as exc:
+            assert "--snapshot" in str(exc)
+        else:
+            raise AssertionError("main-only WAL file unexpectedly read without sidecars")
+        assert not Path(str(main_only_db) + "-wal").exists()
+        assert not Path(str(main_only_db) + "-shm").exists()
+        stale = load_credential(main_only_db, immutable=True)
+        assert stale.access_token == old_access
+        assert any("immutable" in warning for warning in stale.warnings)
+
         cookie_path = root / "candidate.txt"
         write_private_output(
             str(cookie_path),
@@ -1018,7 +1588,8 @@ def build_parser() -> argparse.ArgumentParser:
         description="读取 Cursor 登录信息，并生成网页端可尝试使用的候选 token。",
         epilog=(
             "常用：无参数=简洁信息；--show-token=邮箱+候选值；--print-token=纯一行候选值；"
-            "--output PATH=保存文件。脚本离线运行，候选值不保证网页端一定接受。"
+            "--output PATH=保存文件；WAL 异常时可用 --snapshot。脚本离线运行，"
+            "候选值不保证网页端一定接受。"
         ),
     )
 
@@ -1073,6 +1644,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="只读取并显示简洁账号信息，不写文件也不打印 token",
     )
     parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help=(
+            "先用只读 SQLite backup 创建临时副本再读取；适合 WAL 状态切换，"
+            "不会静默忽略 WAL，临时文件会自动删除"
+        ),
+    )
+    parser.add_argument(
+        "--immutable",
+        "--allow-stale",
+        dest="immutable",
+        action="store_true",
+        help=(
+            "显式按 immutable 主文件读取（可能缺少 WAL 中的最新写入）；"
+            "必须配合 --db，仅适用于已完全退出 Cursor 且没有 WAL sidecar 的静态副本"
+        ),
+    )
+    parser.add_argument(
         "--allow-expired",
         action="store_true",
         help="允许导出 exp 已过期的值（仅用于取证/诊断，通常不应使用）",
@@ -1093,6 +1682,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="使用合成 SQLite/JWT 做本地自测，不读取真实 Cursor 数据库",
     )
     args = parser.parse_args(argv)
+
+    # These storage modes are mutually exclusive even in self-test mode.  Do
+    # the validation before the early self-test return so an accidental
+    # ``--self-test --immutable`` cannot mask the explicit-path safeguard.
+    if args.snapshot and args.immutable:
+        parser.error("--snapshot 与 --immutable 不能同时使用")
+    if args.immutable and not args.db:
+        parser.error("--immutable 必须显式指定 --db，避免误读自动发现的活动数据库")
 
     if args.self_test:
         try:
@@ -1131,6 +1728,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             db_path,
             allow_expired=args.allow_expired,
             strict_user_id=args.strict_user_id,
+            snapshot=args.snapshot,
+            immutable=args.immutable,
         )
 
         # Keep stdout machine-friendly: --print-token emits exactly one raw

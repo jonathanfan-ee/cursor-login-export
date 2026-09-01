@@ -1,7 +1,11 @@
 # Cursor 凭证导出工具
 
 这个小脚本在本机离线读取 Cursor 的 `state.vscdb`，从 access JWT 生成网页端可尝试使用的
-`userId::accessToken` 候选值。它不联网、不启动浏览器，也不会修改 Cursor 数据库。
+`userId::accessToken` 候选值。它不联网、不启动浏览器，也不会修改 Cursor 的业务数据。
+读取 WAL 时 SQLite 可能创建或更新仅用于锁定的 `-shm` sidecar；主库业务表不会写入。
+遇到 SQLite WAL 短暂切换时会自动重试；也可以显式创建临时快照。
+为避免把缺失 WAL 的旧主文件误当成最新登录态，普通模式不会自动启用 `immutable`；检测到
+WAL sidecar 不完整时会停止并给出下一步提示。
 
 脚本只依赖 Python 标准库（建议 Python 3.8+），不需要 `pip install` 或虚拟环境。
 
@@ -12,7 +16,8 @@
 `/Users/your-name/...` 这样的本机绝对路径。
 
 目标设备必须已经安装 Cursor，并在其中登录要导出的账号；本工具读取的是“目标设备自己的”
-本地登录态，不会把源设备的 token 自动搬过去。运行前请完全退出 Cursor，避免数据库正在写入。
+本地登录态，不会把源设备的 token 自动搬过去。运行前请完全退出 Cursor/FlyCursor，
+并暂时停止会读取数据库的扩展（例如 SpecStory），避免 WAL 文件正在切换。
 
 对应平台直接运行：
 
@@ -50,6 +55,34 @@ chmod +x cursor-export-credential.sh cursor-export-token.sh cursor-export-token.
 ./cursor-export-token.sh --db "/path/to/state.vscdb"
 ```
 
+如果普通读取仍提示 `unable to open database file`，先确认 Cursor/FlyCursor 和相关扩展已经完全退出，
+再使用只读 SQLite backup 创建一次性临时副本：
+
+```bash
+./cursor-export-token.sh --snapshot
+```
+
+`--snapshot` 正常结束时会清理临时文件，并需要约一份数据库大小的临时磁盘空间（大型数据库可能
+需要数分钟）；能够打开 WAL
+时会把同一事务视图完整复制到副本，不会写入 `state.vscdb` 主库业务表（SQLite 仍可能更新仅用于
+锁定的 `-shm` sidecar）。如果进程被强制中断，操作系统临时目录中可能暂时留下副本，之后可按
+系统的临时文件清理策略处理。快照创建仍要求源库可被 SQLite 正常打开，且 WAL 数据库的
+`state.vscdb-wal` 与 `state.vscdb-shm` 两个 sidecar 都可访问；不要在应用运行时手动拼接这些文件。
+如果 WAL sidecar 已经丢失，快照无法恢复其中的内容；应从同一时刻的完整备份恢复，或重新登录，
+不要把旧主库直接当成最新登录态。
+
+仅当你已经拿到一个确认静止、完整的主库副本时，才使用高级选项：
+
+```bash
+./cursor-export-credential.sh \
+  --db "/path/to/static/state.vscdb" \
+  --immutable \
+  --show-token
+```
+
+这个模式必须显式指定 `--db`，会忽略 WAL，可能读到旧值；它不会自动启用，也不适合正在运行的
+Cursor 数据库。`--allow-stale` 是同一个选项的兼容别名。
+
 不想默认显示完整凭据时，使用通用入口：
 
 ```bash
@@ -78,6 +111,27 @@ Windows 命令提示符双击入口会暂停在结果画面；脚本化调用若
 curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | python3 - --show-token
 ```
 
+如果遇到 WAL 读取错误，完全退出 Cursor/FlyCursor 和 SpecStory 后，可显式请求临时快照：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | python3 - --snapshot --show-token
+```
+
+如果两个 sidecar 已经确认丢失，`--snapshot` 不能凭空恢复 WAL；只有在你确认主文件是完整静态
+副本、并接受可能读到旧值时，才显式指定路径使用最后的应急模式（会打印醒目警告）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py \
+  | python3 - --db "$HOME/Library/Application Support/Cursor/User/globalStorage/state.vscdb" \
+  --immutable --show-token
+```
+
+Windows 同样只需把参数接在 `py -3 -` 后面：
+
+```powershell
+curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --snapshot --show-token
+```
+
 Windows CMD 或 PowerShell 使用 Windows 自带的原生 curl 和 Python Launcher：
 
 ```powershell
@@ -98,7 +152,7 @@ gh api -H 'Accept: application/vnd.github.raw' \
 
 ## 最快用法
 
-先完全退出 Cursor，再运行：
+先完全退出 Cursor/FlyCursor 和相关扩展，再运行：
 
 ```bash
 python3 cursor-export-credential.py
@@ -142,6 +196,9 @@ python3 cursor-export-credential.py --output ./cursor-session.txt
 python3 cursor-export-credential.py \
   --db "/path/to/state.vscdb" \
   --show-token
+
+# WAL sidecar 切换导致普通读取失败时，创建一次性临时快照
+python3 cursor-export-credential.py --snapshot --show-token
 ```
 
 需要结构化 JSON 时使用 `--format json --output PATH`；`refreshToken` 默认不导出，只有
