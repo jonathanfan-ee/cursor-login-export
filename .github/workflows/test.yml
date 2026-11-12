@@ -26,8 +26,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Original web reader self-test
-        run: python cursor-export-credential.py --self-test
+        run: python -c "import runpy; runpy.run_path('cursor-export-credential.py')['self_test']()"
       - name: Integrated web reader self-test
-        run: python cursor_session_transfer.py --self-test
+        run: python -c "import runpy; runpy.run_path('cursor_session_transfer.py')['self_test']()"
       - name: Transfer and web token tests (synthetic data only)
         run: python -m unittest discover -s . -p 'test_*.py' -v

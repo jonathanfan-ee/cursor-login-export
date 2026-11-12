@@ -1620,7 +1620,8 @@ def self_test() -> None:
             db_path=db_path,
         )
         assert cookie_path.read_text(encoding="utf-8").strip() == credential.session_token
-        assert (cookie_path.stat().st_mode & 0o777) == 0o600
+        if os.name != "nt":
+            assert (cookie_path.stat().st_mode & 0o777) == 0o600
 
         json_path = root / "candidate.json"
         write_private_output(
@@ -1634,7 +1635,8 @@ def self_test() -> None:
         assert parsed["email"] == "demo@example.com"
         assert parsed["emailSource"] == "本地缓存"
         assert parsed["refreshToken"] == refresh
-        assert (json_path.stat().st_mode & 0o777) == 0o600
+        if os.name != "nt":
+            assert (json_path.stat().st_mode & 0o777) == 0o600
 
         # A stale/legacy standalone userId must not override the JWT subject.
         # The candidate should use the token's account and retain a warning.
@@ -2293,4 +2295,8 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        for stream in (sys.stdout, sys.stderr):
+            if hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8", errors="replace")
     raise SystemExit(main())
