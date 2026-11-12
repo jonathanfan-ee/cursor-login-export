@@ -1,0 +1,33 @@
+name: Cross-platform tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.12']
+        include:
+          - os: ubuntu-latest
+            python: '3.8'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Original web reader self-test
+        run: python cursor-export-credential.py --self-test
+      - name: Integrated web reader self-test
+        run: python cursor_session_transfer.py --self-test
+      - name: Transfer and web token tests (synthetic data only)
+        run: python -m unittest discover -s . -p 'test_*.py' -v

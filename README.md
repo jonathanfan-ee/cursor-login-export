@@ -1,259 +1,134 @@
-# Cursor 凭证导出工具
+# Cursor 账号工具：网页 Token 提取与客户端登录状态复制
 
-这个小脚本在本机离线读取 Cursor 的 `state.vscdb`，从 access JWT 生成网页端可尝试使用的
-`userId::accessToken` 候选值。它不联网、不启动浏览器，也不会修改 Cursor 的业务数据。
-源数据库始终只读；`--snapshot` 只会在私有临时副本上转换 journal mode。
-读取 WAL 时 SQLite 可能创建或更新仅用于锁定的 `-shm` sidecar；主库业务表不会写入。
-遇到 SQLite WAL 短暂切换时会自动重试；也可以显式创建临时快照。
-为避免把缺失 WAL 的旧主文件误当成最新登录态，普通模式不会自动启用 `immutable`；检测到
-WAL sidecar 不完整时会停止并给出下一步提示。显式 `--snapshot` 在存在 WAL 帧时使用 SQLite
-backup；如果主库仍标记为 WAL 但当前未发现可读取的帧，会复制主文件并明确提示结果可能过期。
+在账号本人授权的设备之间，离线导出、导入 Cursor 客户端已经保存的登录凭据。源设备只读，
+不执行退出登录；目标设备写入前自动备份。也可直接显示邮箱和网页 `WorkosCursorSessionToken`。
+只依赖 Python 3.8+ 标准库，无需安装 Python 包。
 
-脚本只依赖 Python 标准库（建议 Python 3.8+），不需要 `pip install` 或虚拟环境。
+**两台设备会共用复制的会话；这个工具不能创建独立会话，也不能保证两台设备长期同时在线。**
+跨设备后能否请求、续期，以及一端操作是否影响另一端，取决于 Cursor 服务端。当前依据本机
+Cursor 3.18.9 的存储/刷新代码实现，尚未用真实账号完成跨设备、跨刷新周期验证。
+网页提取复用原来 `cursor-export-credential.py` 的 WAL/快照读取逻辑；旧的
+`--snapshot --show-token` 和 `--snapshot --print-token` 用法同样支持。
 
-## 跨设备一键运行
+## GitHub 一键运行
 
-把这个仓库目录（或发布的便携包）复制到目标设备，不能只复制某一个启动器。
-启动器会按自身所在目录寻找 `cursor-export-credential.py`，所以不再依赖
-`/Users/your-name/...` 这样的本机绝对路径。
+仓库：<https://github.com/jonathanfan-ee/cursor-login-export>。下面使用固定版本 `v0.2.0`。
 
-目标设备必须已经安装 Cursor，并在其中登录要导出的账号；本工具读取的是“目标设备自己的”
-本地登录态，不会把源设备的 token 自动搬过去。运行前请完全退出 Cursor/FlyCursor，
-并暂时停止会读取数据库的扩展（例如 SpecStory），避免 WAL 文件正在切换。
+macOS / Linux（打开中文菜单）：
 
-对应平台直接运行：
-
-```text
-macOS（Finder 双击）：cursor-export-token.command
-macOS / Linux（终端）：./cursor-export-token.sh
-Windows（命令提示符或双击）：cursor-export-token.cmd
-Windows PowerShell：.\cursor-export-token.ps1
+```sh
+curl -fsSL 'https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/v0.2.0/cursor_session_transfer.py' | python3 -
 ```
 
-macOS 首次从网络下载后若被 Gatekeeper 拦截，可在 Finder 中右键该 `.command` 文件并选择“打开”，
-确认后再运行。
-
-这些入口等价于原来的命令：
-
-```bash
-python3 cursor-export-credential.py --show-token
-```
-
-第一次在新设备上使用时，可先运行不读取真实数据库的自测：
-
-```bash
-./cursor-export-credential.sh --self-test
-```
-
-若从 zip 解压后 macOS/Linux 提示没有执行权限，在目录内执行一次：
-
-```bash
-chmod +x cursor-export-credential.sh cursor-export-token.sh cursor-export-token.command
-```
-
-需要自定义参数（例如 `--db`）时，把参数接在启动器后面即可：
-
-```bash
-./cursor-export-token.sh --db "/path/to/state.vscdb"
-```
-
-如果普通读取仍提示 `unable to open database file`，先确认 Cursor/FlyCursor 和相关扩展已经完全退出，
-再使用只读 SQLite backup 创建一次性临时副本：
-
-```bash
-./cursor-export-token.sh --snapshot
-```
-
-`--snapshot` 正常结束时会清理临时文件，并需要约一份数据库大小的临时磁盘空间（大型数据库可能
-需要数分钟）。当 `-wal` 有实际帧且两个 sidecar 可访问时，会把同一事务视图完整复制到副本，
-不会写入 `state.vscdb` 主库业务表（SQLite 仍可能更新仅用于锁定的 `-shm` sidecar）。如果
-`-wal` 缺失、为空或只有 32 字节头部，表示当前未发现可读取的 WAL 帧；脚本会把主文件复制到
-私有临时副本，并警告它可能缺少最近写入（sidecar 缺失时无法判断这是正常 checkpoint 还是异常丢失）。
-如果进程被强制中断，操作系统临时目录中可能暂时留下副本，
-之后可按系统的临时文件清理策略处理。若 `-wal` 有内容但 `-shm` 缺失/不可用，脚本仍会停止，
-这是为了避免在源库可能被占用时重建索引造成不一致；请完全退出 Cursor/FlyCursor 和相关扩展后重试，
-不要删除同目录已有的 `-wal`/`-shm`，让 SQLite 在关闭进程后自行重建缺失的 `-shm`。只有确认
-`-wal` 确实已经丢失且主文件是完整静态副本时，才考虑从备份恢复
-或显式使用 `--immutable`；不要手动拼接或删除 `-wal`/`-shm` 文件。
-
-仅当你已经拿到一个确认静止、完整的主库副本时，才使用高级选项：
-
-```bash
-./cursor-export-credential.sh \
-  --db "/path/to/static/state.vscdb" \
-  --immutable \
-  --show-token
-```
-
-这个模式必须显式指定 `--db`，会忽略 WAL，可能读到旧值；它不会自动启用，也不适合正在运行的
-Cursor 数据库。`--allow-stale` 是同一个选项的兼容别名。
-
-不想默认显示完整凭据时，使用通用入口：
-
-```bash
-./cursor-export-credential.sh --info
-./cursor-export-credential.sh --output ./cursor-session.txt
-```
-
-Windows 的通用入口是 `cursor-export-credential.cmd`；PowerShell 的通用入口是
-`cursor-export-credential.ps1`。
-
-PowerShell 若被执行策略拦截，可在该目录打开 PowerShell 后运行：
+Windows PowerShell（下载后运行，兼容 PowerShell 5.1 的编码处理）：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\cursor-export-token.ps1
+curl.exe -fsSL "https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/v0.2.0/cursor_session_transfer.py" -o "$env:TEMP\cursor-tool.py"; if ($LASTEXITCODE -eq 0) { py -3 "$env:TEMP\cursor-tool.py" }
 ```
 
-Windows 命令提示符双击入口会暂停在结果画面；脚本化调用若不需要暂停，可先设置
-`CURSOR_EXPORT_NO_PAUSE=1`。
+菜单 `1` 导出客户端凭据、`2` 导入、`5` 提取网页 Token。管道运行时菜单会重新连接本机终端；
+没有交互终端的环境请指定子命令。只需要网页 Token 时也可直接运行：
 
-## GitHub 一行命令
-
-仓库发布后，可以直接从 GitHub 把脚本流式交给本机 Python，不需要手动下载或落盘。
-终端里请粘贴纯 URL，不要带 Markdown 的 `[]()`：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | python3 - --show-token
+```sh
+curl -fsSL 'https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/v0.2.0/cursor_session_transfer.py' | python3 - --snapshot --show-token
 ```
 
-如果遇到 WAL 读取错误，完全退出 Cursor/FlyCursor 和 SpecStory 后，可显式请求临时快照：
+Windows 的对应写法是把 `python3 -` 替换为 `py -3 -`，并使用 `curl.exe`。
+如果 PowerShell 管道出现中文编码问题，请使用上面的下载后运行方式，再在本地命令末尾加
+`web-token` 或 `--snapshot --show-token`。
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | python3 - --snapshot --show-token
+## 最简单的使用方法
+
+把这个目录发给朋友；实际使用只需要主 Python 文件和对应系统的启动文件。
+Windows 双击 `start.cmd`；macOS 从终端执行 `sh start.command`（解压后有执行权限时也可双击）；
+Linux 执行 `sh start.sh`。如果尚未安装 Python，先从 <https://www.python.org/downloads/> 安装。
+
+1. 旧设备：**完全关闭 Cursor 程序，但不要点 Sign Out/退出账号**。请从系统终端运行工具，
+   不要使用 Cursor 内置终端。选择 `1. 旧设备：导出`，回车使用默认文件位置。
+2. 将生成的 JSON 文件私下传到新设备。该文件包含明文 access/refresh 凭据。
+3. 新设备先正常安装并启动一次 Cursor，再完全关闭程序。运行工具，选 `2. 新设备：导入`，
+   粘贴 JSON 文件路径，核对邮箱，输入 `y`。
+4. 重开两台设备的 Cursor，分别验证实际请求。还需要观察下一次自动续期是否正常，
+   不能以显示头像/邮箱或第一次请求成功作为长期双机可用的证明。
+
+菜单 `5. 提取网页 Token` 只读取当前设备，直接在终端显示邮箱和可复制的一整行候选值；
+不导出 refreshToken，也不写入 JSON。它默认使用临时 SQLite 快照，正常结束时自动清理。
+`--snapshot` 可能需要约一份数据库大小的临时磁盘空间；没有可读 WAL 帧时会明确提示结果可能过期。
+
+脚本不会读取或改写机器 ID、系统钥匙串、设备指纹，不联网、不自动刷新、不执行退出登录。
+导入只更新认证字段并清理几项账号缓存，不覆盖整份数据库，不迁移聊天、插件或设置。
+
+## 直接运行命令
+
+macOS / Linux：
+
+```sh
+python3 cursor_session_transfer.py
+
+# 只提取网页 Token
+python3 cursor_session_transfer.py web-token
+
+# 旧设备
+python3 cursor_session_transfer.py export --output ./cursor-session.json
+
+# 新设备
+python3 cursor_session_transfer.py import ./cursor-session.json
 ```
 
-如果 `-wal` 曾经有内容但现在丢失，`--snapshot` 不能凭空恢复其中的提交；只有在你确认主文件
-是完整静态副本、并接受可能读到旧值时，才显式指定路径使用最后的应急模式（会打印醒目警告）：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py \
-  | python3 - --db "$HOME/Library/Application Support/Cursor/User/globalStorage/state.vscdb" \
-  --immutable --show-token
-```
-
-Windows 同样只需把参数接在 `py -3 -` 后面：
+Windows PowerShell / 命令提示符：
 
 ```powershell
-curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --snapshot --show-token
+py -3 cursor_session_transfer.py
+py -3 cursor_session_transfer.py web-token
+py -3 cursor_session_transfer.py export --output .\cursor-session.json
+py -3 cursor_session_transfer.py import .\cursor-session.json
 ```
 
-如果 Windows 上自动发现的路径不确定，可以先在 CMD 查看两个常见位置（`/a` 会显示隐藏文件）：
+默认自动识别的数据库位置：
 
-```bat
-dir /a "%APPDATA%\Cursor\User\globalStorage\state.vscdb*"
-dir /a "%LOCALAPPDATA%\Cursor\User\globalStorage\state.vscdb*"
+| 系统 | 数据库 |
+|---|---|
+| macOS | `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb` |
+| Windows | `%APPDATA%\Cursor\User\globalStorage\state.vscdb` |
+| Linux | `${XDG_CONFIG_HOME:-~/.config}/Cursor/User/globalStorage/state.vscdb` |
+
+便携版、自定义用户目录或其他安装方式可加 `--db "完整的 state.vscdb 路径"`。
+客户端迁移操作检测到 Cursor 进程时会停止；网页 Token 提取沿用只读快照逻辑，不强制检查进程。
+如果环境没有 `ps`/`tasklist`，在手动确认程序完全关闭后
+可以加 `--closed`；这只是跳过本地进程检查，不改变任何服务端行为。
+
+## 恢复本机原状态
+
+每次导入/恢复前，工具都将即将改动的原始字段备份到数据库旁的
+`cursor-session-backups/`，成功时打印完整路径。选择菜单 `3`，或者：
+
+```sh
+python3 cursor_session_transfer.py restore "/完整路径/before-import-时间-随机值.json"
 ```
 
-然后显式指定实际存在的库。CMD 写法：
+恢复只回写本机字段；**备份无法恢复已经被服务端撤销、轮换或过期的会话**。
+旧设备的数据库从未被这个工具写入，但新设备对共用会话的服务端操作仍可能影响旧设备。
 
-```bat
-curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py ^
-  | py -3 - --db "%APPDATA%\Cursor\User\globalStorage\state.vscdb" --snapshot --show-token
+## 可直接转发的提醒
+
+> 用完网页后不要点击 **Log out**，也不要在任何一台客户端点 **Sign Out** 或在会话管理页撤销会话。
+> 我们之前实测过：用客户端凭证登录网页后点击 Log out，源客户端随后出现 Authentication error。
+> 这次复制同样不能保证两台设备互相独立。一端退出、凭据轮换或服务端要求重新验证，都可能导致掉线。
+> 你目前收不到手机验证码，掉线后可能暂时无法重新登录；这不代表永远无法恢复，但需要恢复手机号
+> 或联系 Cursor 官方支持。迁移文件和备份都含登录凭据，不要公开分享。关闭网页不等于服务端退出。
+
+## 验证范围
+
+```sh
+python3 -m unittest discover -s . -p 'test_*.py' -v
 ```
 
-PowerShell 写法：
+测试使用临时合成 SQLite/JWT；覆盖三系统默认路径、源库只读、目标无关数据保留、自动备份/恢复、
+失败回滚、网页提取和旧参数兼容。GitHub Actions 将在 Windows/macOS/Linux 的 Python 3.12、
+以及 Linux 的 Python 3.8 上运行这些测试；具体通过状态见仓库 Actions。
+未用真实凭据进行跨机登录或长期续期测试。
 
-```powershell
-curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --db "$env:APPDATA\Cursor\User\globalStorage\state.vscdb" --snapshot --show-token
-```
+## 旧版独立导出工具
 
-只有确认 `-wal` 已经永久丢失、并接受主库可能是旧值时，才把上面命令中的
-`--snapshot` 换成 `--immutable`；该模式必须保留 `--db`。
-
-Windows CMD 或 PowerShell 使用 Windows 自带的原生 curl 和 Python Launcher：
-
-```powershell
-curl.exe -fsSL https://raw.githubusercontent.com/jonathanfan-ee/cursor-login-export/main/cursor-export-credential.py | py -3 - --show-token
-```
-
-建议在实际分发时把 `main` 替换成已审核的完整 commit SHA，以避免远端分支变化带来的供应链风险。
-如果使用的是旧的固定 SHA，脚本不会自动更新；修复发布后需要改用新的 SHA，或暂时使用上面的 `main`。
-Windows PowerShell 5.1 中，裸写 `curl` 可能会被解析为 `Invoke-WebRequest`，因此这里明确写 `curl.exe`。
-私有仓库则不要使用公开 raw 地址；在已登录 GitHub CLI 的设备上运行：
-
-```bash
-gh api -H 'Accept: application/vnd.github.raw' \
-  'repos/jonathanfan-ee/cursor-login-export/contents/cursor-export-credential.py?ref=main' \
-  | python3 - --show-token
-```
-
-上述命令需要目标设备已安装 `curl`/`curl.exe` 或 `gh`，以及 Python 3.8+；不会把脚本保存到磁盘。
-
-## 最快用法
-
-先完全退出 Cursor/FlyCursor 和相关扩展，再运行：
-
-```bash
-python3 cursor-export-credential.py
-```
-
-默认只显示简洁信息：邮箱（如果本地有缓存）、账号 ID 和到期时间，不显示完整 token。
-
-需要在终端看到邮箱和完整候选值时，显式运行：
-
-```bash
-python3 cursor-export-credential.py --show-token
-```
-
-输出格式是：
-
-```text
-邮箱：you@example.com
-WorkosCursorSessionToken（复制下一行）：
-user_xxx::<JWT>
-```
-
-只输出一行纯候选值（适合管道或直接粘贴）：
-
-```bash
-python3 cursor-export-credential.py --print-token
-```
-
-`--print` 和 `--token-only` 是 `--print-token` 的兼容别名。完整 token 只会在这些显式
-选项下输出；普通状态、错误和 `--dry-run` 不会夹带 token。
-
-## 常用选项
-
-```bash
-# 只看简洁信息，不写文件、不显示 token
-python3 cursor-export-credential.py --info
-
-# 保存为私有文件（macOS/Linux 为 0600）
-python3 cursor-export-credential.py --output ./cursor-session.txt
-
-# 配置库路径不在默认位置时
-python3 cursor-export-credential.py \
-  --db "/path/to/state.vscdb" \
-  --show-token
-
-# WAL sidecar 切换导致普通读取失败时，创建一次性临时快照
-python3 cursor-export-credential.py --snapshot --show-token
-```
-
-需要结构化 JSON 时使用 `--format json --output PATH`；`refreshToken` 默认不导出，只有
-明确需要时才加 `--include-refresh`。`--show-meta` 是诊断模式，会显示更多 JWT 元数据。
-
-## 账号与有效期
-
-邮箱优先读取 Cursor 的本地 `cursorAuth/cachedEmail`；没有缓存时只尝试读取 JWT 中已有的
-`email` claim，不会联网查询，所以显示“未缓存”是正常的。独立的旧版/第三方
-`cursorAuth/userId` 只作提示；冲突时默认按 JWT `sub` 生成。需要审计旧字段一致性时再加
-`--strict-user-id`。
-
-脚本只解析 JWT 的 `exp`，不验证签名，也不向 Cursor 在线确认会话是否仍有效；候选值不
-保证网页端一定接受。网页或 IDE 拒绝时，直接使用 Cursor 官方登录流程。
-
-## 自测
-
-```bash
-python3 cursor-export-credential.py --self-test
-```
-
-自测只使用临时合成 SQLite/JWT，不读取真实 Cursor 数据库。
-
-## 凭据安全
-
-`--show-token` 会把完整的 session JWT 明文写到终端；它应按密码级秘密处理。不要把输出写进
-聊天记录、工单、截图、CI 日志、云盘或代码仓库，也不要把源设备的 `state.vscdb` 一起分发。
-脚本不会联网验证 token；网页端是否接受仍由 Cursor 服务端决定。若只需保存候选值，优先使用
-`--output`（macOS/Linux 会创建 0600 文件），并在使用后及时删除或撤销凭据。
+原来的 `cursor-export-credential.py --snapshot --show-token` 及其启动器继续保留。
+详细参数与 WAL 故障排查见 [旧版说明](LEGACY_EXPORT.md)。
